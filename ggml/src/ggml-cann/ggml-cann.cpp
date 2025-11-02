@@ -2409,7 +2409,21 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
 
         // ===== OUT_PROD =====
         case GGML_OP_OUT_PROD: {
-            return true;
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                // case GGML_TYPE_F16:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1: 
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_IQ2_XXS:
+                    return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                    // return (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && 
+                    //        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                default:
+                    return false;
+            }
         }
 
         case GGML_OP_ROPE: {
