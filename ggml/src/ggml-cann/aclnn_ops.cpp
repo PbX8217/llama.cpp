@@ -440,7 +440,7 @@ static inline void ggml_cann_out_prod_f32(
     ggml_backend_cann_context & ctx,
     ggml_tensor * src0,      // src0 (F32)
     ggml_tensor * src1,      // src1 (F32)
-    ggml_tensor * dst) {  // dst  (F32)
+    ggml_tensor * dst) {     // dst  (F32)
 
     GGML_ASSERT(src0  && src1 && dst);
     GGML_ASSERT(src0->type  == GGML_TYPE_F32);
@@ -452,15 +452,15 @@ static inline void ggml_cann_out_prod_f32(
     GGML_ASSERT(dst->ne[0] == ne00);
     GGML_ASSERT(dst->ne[1] == ne10);
 
-    // CPU 端约束：B 与 C 的批维一致；A 的批维可被 C 整数倍复制
+    // B 与 C 的批维一致；A 的批维可被 C 整数倍复制
     GGML_ASSERT(ne2 == ne12);
     GGML_ASSERT(ne3 == ne13);
 
-    // K 维：允许 A 或 B 为 1（标量）来广播
+    // K 维：允许 A 或 B 为 1 来广播
     const int64_t K = std::max(ne01, ne11);
     GGML_ASSERT(ne01 == 1 || ne11 == 1 || ne01 == ne11);
 
-    // 分组复制系数（与 CPU 实现一致）
+    // 分组复制系数
     const int64_t A_ne2 = std::max<int64_t>(ne02, 1);
     const int64_t A_ne3 = std::max<int64_t>(ne03, 1);
 
@@ -469,11 +469,11 @@ static inline void ggml_cann_out_prod_f32(
     const int64_t dps2 = ne2 / A_ne2;  // 每个 A.i2 复制 dps2 次到 C
     const int64_t dps3 = ne3 / A_ne3;  // 每个 A.i3 复制 dps3 次到 C
 
-    // K 维广播（步长置 0 即可）
+    // K 维广播（步长置 0 ）
     const size_t A_nbK = (ne01 == 1 && K > 1) ? 0 : sizeof(float) * ne00;
     const size_t B_nbK = (ne11 == 1 && K > 1) ? 0 : nb11;
 
-    // 工具：构造 3D ND tensor [1, D1, D2]，把“batch 维”对 CANN 说成 1（nbB=0）
+    // 工具：构造 3D ND tensor [1, D1, D2]
     auto make_acl3 = [&](ggml_tensor * t,
                      size_t byte_offset,
                      int64_t M, int64_t N,
@@ -483,7 +483,7 @@ static inline void ggml_cann_out_prod_f32(
         return ggml_cann_create_tensor(t, ne_in, nb_in, /*dims=*/3, ACL_FORMAT_ND, byte_offset);
     };
 
-    // 遍历 C 的每个批块，按 CPU 规则计算 A/B 的对应批块
+    // 遍历 C 的每个批块，计算 A/B 的对应批块
     for (int64_t c_i3 = 0; c_i3 < ne3; ++c_i3) {
         for (int64_t c_i2 = 0; c_i2 < ne2; ++c_i2) {
             // C 的批索引
@@ -526,198 +526,88 @@ static inline void ggml_cann_out_prod_f32(
 }
 
 static inline void ggml_cann_out_prod_q0_f32(ggml_backend_cann_context & ctx,
-                                                 ggml_tensor *               src0,  // src0 (quantized)
-                                                 ggml_tensor *               src1,  // src1 (F32/F16)
-                                                 ggml_tensor *               dst) {               // dst  (F32/F16)
-
+                                             ggml_tensor *               src0,  // src0 (quantized)
+                                             ggml_tensor *               src1,  // src1 (F32/F16)
+                                             ggml_tensor *               dst){
     GGML_ASSERT(src0 && src1 && dst);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0);
+    
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(ggml_is_quantized(src0->type));
 
-    GGML_TENSOR_BINARY_OP_LOCALS;
+    // 维度与步长（ggml 约定：ne[0] 为最快维）
+    const int64_t ne0 = src0->ne[0];
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
 
-    GGML_ASSERT(dst->ne[0] == ne00);
-    GGML_ASSERT(dst->ne[1] == ne10);
+    // 量化行通常要求：dim0 逐元素紧致
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
 
-    // CPU 端约束：B 与 C 的批维一致；A 的批维可被 C 整数倍复制
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
+    // 1) 从后端取回到主机，后端会做 transform_back，得到 ggml 原生量化排布
+    const size_t qbytes = ggml_nbytes(src0);
+    std::vector<uint8_t> host_q(qbytes);
+    ggml_backend_tensor_get(src0, host_q.data(), /*offset=*/0, qbytes);
 
-    // K 维：允许 A 或 B 为 1（标量）来广播
-    const int64_t K = std::max(ne01, ne11);
-    GGML_ASSERT(ne01 == 1 || ne11 == 1 || ne01 == ne11);
+    // 2) 主机侧逐行反量化为 F32
+    const size_t n_elem = (size_t)ne0*ne1*ne2*ne3;
+    std::vector<float> host_f32(n_elem);
 
-    // 分组复制系数（与 CPU 实现一致）
-    const int64_t A_ne2 = std::max<int64_t>(ne02, 1);
-    const int64_t A_ne3 = std::max<int64_t>(ne03, 1);
+    ggml_to_float_t deq_row = ggml_get_type_traits(src0->type)->to_float;
+    GGML_ASSERT(deq_row != nullptr);
 
-    GGML_ASSERT(ne2 % A_ne2 == 0);
-    GGML_ASSERT(ne3 % A_ne3 == 0);
-    const int64_t dps2 = ne2 / A_ne2;  // 每个 A.i2 复制 dps2 次到 C
-    const int64_t dps3 = ne3 / A_ne3;  // 每个 A.i3 复制 dps3 次到 C
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
 
-    // K 维广播（步长置 0 即可）
-    const size_t B_nbK = (ne11 == 1 && K > 1) ? 0 : nb11;
-
-    // 工具：构造 3D ND tensor [1, D1, D2]，把"batch 维"对 CANN 说成 1（nbB=0）
-    auto make_acl3 = [&](ggml_tensor * t,
-                     size_t byte_offset,
-                     int64_t M, int64_t N,
-                     size_t nbM, size_t nbN) -> aclTensor * {
-        int64_t ne_in[3] = { N, M, 1 };   // 预反转
-        size_t  nb_in[3] = { nbN, nbM, 0 }; // batch 维步长 0 → 单批
-        return ggml_cann_create_tensor(t, ne_in, nb_in, /*dims=*/3, ACL_FORMAT_ND, byte_offset);
-    };
-
-    auto make_acl3_buffer = [&](void * buffer,
-                            size_t byte_offset,
-                            int64_t M, int64_t N,
-                            size_t nbM, size_t nbN) -> aclTensor * {
-        int64_t ne_in[3] = { N, M, 1 };   // 预反转
-        size_t  nb_in[3] = { nbN, nbM, 0 }; // batch 维步长 0 → 单批
-        return ggml_cann_create_tensor(buffer, ACL_FLOAT, sizeof(float), ne_in, nb_in, /*dims=*/3, ACL_FORMAT_ND, byte_offset);
-    };
-
-    float weight_elem_size;
-    size_t block_ne0;
-
-    switch (src0->type)
-    {
-    case GGML_TYPE_Q8_0:
-        weight_elem_size = (float)sizeof(uint8_t);
-        block_ne0 = QK8_0;
-        break;
-    case GGML_TYPE_Q4_0:
-        weight_elem_size = (float)sizeof(uint8_t) / 2;
-        block_ne0 = QK4_0;
-        break;
-    default:
-        GGML_ABORT("unsupported quantized type");
-        break;
-    }
-
-    GGML_ASSERT(ne01 > 0);
-    GGML_ASSERT(ne00 % block_ne0 == 0);
-    int64_t blocks_per_row = ne00 / block_ne0;
-    int64_t per_batch_elems = ne01 * ne00;
-    int64_t per_batch_scales = ne01 * blocks_per_row;
-    size_t total_weight_bytes = ggml_nelements(src0) * weight_elem_size;
-    uint8_t * weight_base = (uint8_t *)src0->data;
-    uint16_t * scale_base = (uint16_t *)((char *)src0->data + total_weight_bytes);
-    ggml_cann_pool_alloc dequant_buffer_allocator(ctx.pool(), ne00 * ne01 * sizeof(float));
-    void * dequant_buffer = dequant_buffer_allocator.get();
-
-    // A 的步长（支持 K 维广播）
-    const size_t A_nbM = sizeof(float);
-    const size_t A_nbK = (ne01 == 1 && K > 1) ? 0 : sizeof(float) * ne00;
-
-    // 遍历 C 的每个批块，按 CPU 规则计算 A/B 的对应批块
-    for (int64_t c_i3 = 0; c_i3 < ne3; ++c_i3) {
-        for (int64_t c_i2 = 0; c_i2 < ne2; ++c_i2) {
-            // C 的批索引
-            const size_t c_off = (size_t)c_i2 * nb2 + (size_t)c_i3 * nb3;
-
-            // A 的批索引（分组复制：用"整除"）
-            const int64_t a_i2 = (A_ne2 == 1) ? 0 : (c_i2 / dps2);
-            const int64_t a_i3 = (A_ne3 == 1) ? 0 : (c_i3 / dps3);
-            const size_t  a_off = (size_t)a_i2 * nb02 + (size_t)a_i3 * nb03;
-
-            // B 的批索引（与 C 一致，无分组）
-            const int64_t b_i2 = (ne12 == 0) ? 0 : c_i2;
-            const int64_t b_i3 = (ne13 == 0) ? 0 : c_i3;
-            const size_t  b_off = (size_t)b_i2 * nb12 + (size_t)b_i3 * nb13;
-
-            const int64_t actual_ne2 = std::max<int64_t>(ne02, (int64_t)1);
-            const int64_t cols = ne01;
-            const int64_t batch_index = a_i2 + actual_ne2 * a_i3;
-            const size_t weight_offset_elems = (size_t)batch_index * (size_t)(per_batch_elems);
-            const size_t weight_offset_bytes = weight_offset_elems * (weight_elem_size / (float)sizeof(uint8_t));
-            const size_t scale_offset_elems = (size_t)batch_index * (size_t)per_batch_scales;
-            int8_t * raw_weight_ptr = (int8_t *)(weight_base + weight_offset_bytes);
-            uint16_t * scale_ptr = scale_base + scale_offset_elems;
-            int64_t weight_ne[3] = { (int64_t)block_ne0, blocks_per_row, cols };
-            size_t weight_nb[3];
-            weight_nb[0] = sizeof(int8_t);
-            weight_nb[1] = weight_nb[0] * weight_ne[0];
-            weight_nb[2] = weight_nb[1] * weight_ne[1];
-            int64_t scale_ne[3] = { 1, blocks_per_row, cols };
-            size_t scale_nb[3];
-            scale_nb[0] = sizeof(uint16_t);
-            scale_nb[1] = scale_nb[0] * scale_ne[0];
-            scale_nb[2] = scale_nb[1] * scale_ne[1];
-            int64_t dequant_ne[3] = { (int64_t)block_ne0, blocks_per_row, cols };
-            size_t dequant_nb[3];
-            dequant_nb[0] = sizeof(float);
-            dequant_nb[1] = dequant_nb[0] * dequant_ne[0];
-            dequant_nb[2] = dequant_nb[1] * dequant_ne[1];
-
-            ggml_cann_pool_alloc temp_weight_allocator(ctx.pool());
-            int8_t * weight_ptr = nullptr;
-
-            // unpack Q4_0 to int8_t buffer
-            if (src0->type == GGML_TYPE_Q4_0) {
-                // Copy quantized data to host buffer
-                size_t quant_bytes = (size_t)ne01 * ((size_t)ne00 / 2) * sizeof(uint8_t);
-                std::vector<char> quant_host(quant_bytes);
-                ggml_cann_async_memcpy(ctx, quant_host.data(), raw_weight_ptr, quant_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
-
-                // Unpack on host
-                std::vector<int8_t> weight_host((size_t)ne01 * (size_t)ne00);
-                weight_ptr = weight_host.data();
-                for (int i = 0; i < ne01; i++) {
-                    for (int j = 0; j < ne00 / 2; j++) {
-                        uint8_t byte = ((uint8_t *)quant_host.data())[i * (ne00 / 2) + j];
-                        weight_ptr[i * ne00 + j * 2] = (int8_t)((byte & 0x0F) - 8);
-                        weight_ptr[i * ne00 + j * 2 + 1] = (int8_t)((byte >> 4) - 8);
-                    }
-                }
-                // Allocate device buffer and copy unpacked data to device
-                ggml_cann_pool_alloc device_weight_allocator(ctx.pool(), (size_t)ne01 * (size_t)ne00 * sizeof(int8_t));
-                void * device_weight_ptr = device_weight_allocator.get();
-                ggml_cann_async_memcpy(ctx, device_weight_ptr, weight_ptr, (size_t)ne01 * (size_t)ne00 * sizeof(int8_t), ACL_MEMCPY_HOST_TO_DEVICE);
-                ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
-                weight_ptr = (int8_t *)device_weight_ptr;
+    size_t row = 0;
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                const void *qptr = (const void *)((const char*)host_q.data() + i1*nb01 + i2*nb02 + i3*nb03);
+                float *fptr = host_f32.data() + row*ne0;
+                deq_row(qptr, fptr, (int)ne0);
+                ++row;
             }
-            else // Q8_0
-            {
-                weight_ptr = raw_weight_ptr;
-            }
-
-            aclTensor * acl_weight_tensor = ggml_cann_create_tensor(weight_ptr, ACL_INT8, sizeof(int8_t), weight_ne, weight_nb, 3);
-            aclTensor * acl_scale_tensor = ggml_cann_create_tensor(scale_ptr, ACL_FLOAT16, sizeof(uint16_t), scale_ne, scale_nb, 3);
-            aclTensor * dequant_tensor = ggml_cann_create_tensor(dequant_buffer, ACL_FLOAT, sizeof(float), dequant_ne, dequant_nb, 3);
-            aclnn_mul(ctx, acl_weight_tensor, acl_scale_tensor, dequant_tensor);
-            aclTensor * acl_src0 = make_acl3_buffer(dequant_buffer, 0, ne00, K, A_nbM, A_nbK);
-            ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, dequant_tensor);
-
-            // B: [K, J]  →  make_acl3(M=K, N=J, nbM=B_nb1, nbN=B_nb0)
-            aclTensor * acl_src1 = make_acl3(src1, b_off, /*M*/ K, /*N*/ ne10,
-                                             /*nbM*/ B_nbK, /*nbN*/ nb10);
-
-            // C: [I, J]  →  make_acl3(M=I, N=J, nbM=C_nb0, nbN=C_nb1)
-            aclTensor * acl_dst = make_acl3(dst, c_off, /*M*/ ne00, /*N*/ ne10,
-                                            /*nbM*/ nb0, /*nbN*/ nb1);
-
-            const int8_t transpose_x1 = 0;
-            GGML_CANN_CALL_ACLNN_OP(
-                ctx, BatchMatMul,
-                /*x1=*/acl_src0,
-                /*x2=*/acl_src1,
-                /*out=*/acl_dst,
-                /*transpose_x1=*/transpose_x1
-            );
-
-            ggml_cann_release_resources(ctx, acl_src0, acl_src1, acl_dst);
         }
     }
+
+    // 3) 申请设备侧 F32 buffer 并拷贝
+    void *dev_ptr = nullptr;
+    const size_t f32_bytes = n_elem*sizeof(float);
+    ACL_CHECK(aclrtMalloc(&dev_ptr, f32_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMemcpy(dev_ptr, f32_bytes, host_f32.data(), f32_bytes,
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // 4) 构造一个最小 ggml_tensor 壳，描述这块 F32 设备内存（行主序致密）
+    ggml_tensor *tmp = new ggml_tensor();
+    memset(tmp, 0, sizeof(*tmp));
+    tmp->type = GGML_TYPE_F32;
+    tmp->ne[0] = ne0; tmp->ne[1] = ne1; tmp->ne[2] = ne2; tmp->ne[3] = ne3;
+    tmp->nb[0] = sizeof(float);
+    tmp->nb[1] = tmp->nb[0]*ne0;
+    tmp->nb[2] = tmp->nb[1]*ne1;
+    tmp->nb[3] = tmp->nb[2]*ne2;
+    tmp->data  = dev_ptr;
+    
+    ggml_cann_out_prod_f32(ctx, tmp, src1, dst);
+    
+    if (!tmp) return;
+    if (tmp->data) {
+        ACL_CHECK(aclrtFree(tmp->data));
+        tmp->data = nullptr;
+    }
+    delete tmp;
+    GGML_UNUSED(ctx);
 }
 
 static inline void ggml_cann_out_prod_q_f32(
     ggml_backend_cann_context & ctx,
     ggml_tensor * src0,      // src0 (quantized)
     ggml_tensor * src1,      // src1 (F32)
-    ggml_tensor * dst) {  // dst  (F32)
+    ggml_tensor * dst) {     // dst  (F32)
 
     GGML_ASSERT(src0  && src1 && dst);
     GGML_ASSERT(src1->type  == GGML_TYPE_F32);
@@ -728,15 +618,15 @@ static inline void ggml_cann_out_prod_q_f32(
     GGML_ASSERT(dst->ne[0] == ne00);
     GGML_ASSERT(dst->ne[1] == ne10);
 
-    // CPU 端约束：B 与 C 的批维一致；A 的批维可被 C 整数倍复制
+    // B 与 C 的批维一致；A 的批维可被 C 整数倍复制
     GGML_ASSERT(ne2 == ne12);
     GGML_ASSERT(ne3 == ne13);
 
-    // K 维：允许 A 或 B 为 1（标量）来广播
+    // K 维：允许 A 或 B 为 1 来广播
     const int64_t K = std::max(ne01, ne11);
     GGML_ASSERT(ne01 == 1 || ne11 == 1 || ne01 == ne11);
 
-    // 分组复制系数（与 CPU 实现一致）
+    // 分组复制系数
     const int64_t A_ne2 = std::max<int64_t>(ne02, 1);
     const int64_t A_ne3 = std::max<int64_t>(ne03, 1);
 
@@ -745,10 +635,10 @@ static inline void ggml_cann_out_prod_q_f32(
     const int64_t dps2 = ne2 / A_ne2;  // 每个 A.i2 复制 dps2 次到 C
     const int64_t dps3 = ne3 / A_ne3;  // 每个 A.i3 复制 dps3 次到 C
 
-    // K 维广播（步长置 0 即可）
+    // K 维广播
     const size_t B_nbK = (ne11 == 1 && K > 1) ? 0 : nb11;
 
-    // 工具：构造 3D ND tensor [1, D1, D2]，把"batch 维"对 CANN 说成 1（nbB=0）
+    // 工具：构造 3D ND tensor [1, D1, D2]
     auto make_acl3 = [&](ggml_tensor * t,
                      size_t byte_offset,
                      int64_t M, int64_t N,
@@ -779,7 +669,7 @@ static inline void ggml_cann_out_prod_q_f32(
     const size_t A_nbM = sizeof(float);
     const size_t A_nbK = (ne01 == 1 && K > 1) ? 0 : sizeof(float) * ne00;
 
-    // 遍历 C 的每个批块，按 CPU 规则计算 A/B 的对应批块
+    // 遍历 C 的每个批块，计算 A/B 的对应批块
     for (int64_t c_i3 = 0; c_i3 < ne3; ++c_i3) {
         for (int64_t c_i2 = 0; c_i2 < ne2; ++c_i2) {
             // C 的批索引
@@ -839,7 +729,7 @@ static inline void ggml_cann_out_prod_q_f32(
     }
 }
 
-// ================ 算子入口 ====================
+// ================ OUT_PROD ====================
 void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * A = dst->src[0];
     ggml_tensor * B = dst->src[1];
@@ -852,7 +742,7 @@ void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_F16:
             {
-                GGML_ABORT("fatal error");  // todo
+                GGML_ABORT("fatal error");  // todo(BOTH at CPU end)
             }
             break;
         case GGML_TYPE_Q8_0:

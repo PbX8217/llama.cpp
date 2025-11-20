@@ -1771,6 +1771,7 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
                     return false;
             }
             break;
+        // ===== OUT_PROD =====
         case GGML_OP_OUT_PROD:
             ggml_cann_out_prod(ctx, dst);
             return true;
